@@ -1,0 +1,61 @@
+# Aegis Example Configuration
+version: 1
+
+project:
+  name: "aegis-harness"
+  stack: "python"
+
+model:
+  provider: "gemini"
+  model: null
+  temperature: 0.2
+
+agent:
+  max_turns: 24
+  max_repairs: 5
+  max_tool_calls: 100
+  max_command_runtime_seconds: 60
+  max_output_size_bytes: 100000
+
+verification:
+  pre_flight: null
+  lint: null
+  test_cmd: ".venv/bin/pytest tests/ -q"
+  build_cmd: null
+  timeout_seconds: 60
+  required_gates:
+    - "test_cmd"
+
+guardrails:
+  deny_paths:
+    - ".git/**"
+    - ".env"
+    - ".env.*"
+    - "secrets/**"
+    - "*.pem"
+    - "*.key"
+    - "id_rsa*"
+    - "credentials*"
+    - ".ssh/**"
+  fail_closed: true
+  interactive_by_default: false
+  blocked_commands:
+    - "rm -rf /"
+    - "sudo"
+    - "su"
+    - "mkfs"
+  allow_network: false
+
+execution:
+  backend: "auto"
+  network: "none"
+  timeout_seconds: 60
+
+memory:
+  enabled: true
+  path: ".aegis/memory.json"
+  top_k: 5
+
+telemetry:
+  enabled: true
+  path: ".aegis/traces"

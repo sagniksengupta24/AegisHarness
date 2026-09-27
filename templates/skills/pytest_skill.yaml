@@ -1,0 +1,20 @@
+name: "pytest_testing"
+description: "Pytest conventions and test running guidance"
+triggers:
+  files:
+    - "test_*.py"
+    - "*_test.py"
+    - "conftest.py"
+  keywords:
+    - "test"
+    - "pytest"
+    - "coverage"
+  stacks:
+    - "python"
+instructions: |
+  1. Organize tests under tests/unit, tests/integration, and tests/security.
+  2. Use descriptive test function names prefixed with test_.
+  3. Favor explicit assertions: assert actual == expected.
+  4. Avoid sleeping in tests; use events or poll with short intervals where needed.
+tools: []
+enabled: true

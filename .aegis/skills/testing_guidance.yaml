@@ -1,0 +1,20 @@
+name: "testing_guidance"
+description: "Guidelines for writing robust test suites"
+triggers:
+  files:
+    - "test_*.py"
+    - "*_test.go"
+    - "*.test.ts"
+  keywords:
+    - "test"
+    - "pytest"
+    - "verify"
+  stacks:
+    - "python"
+    - "typescript"
+instructions: |
+  Always ensure test fixtures are cleaned up.
+  Do not mock external verification gates.
+  Prefer deterministic assertion values over random inputs.
+tools: []
+enabled: true

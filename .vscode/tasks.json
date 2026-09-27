@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Aegis: Run Task",
+      "type": "shell",
+      "command": "aegis run --task \"${input:taskPrompt}\"",
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Aegis: Strict Verify",
+      "type": "shell",
+      "command": "aegis verify",
+      "problemMatcher": [],
+      "group": "test"
+    },
+    {
+      "label": "Aegis: Diff",
+      "type": "shell",
+      "command": "aegis diff",
+      "problemMatcher": [],
+      "group": "none"
+    },
+    {
+      "label": "Aegis: Doctor",
+      "type": "shell",
+      "command": "aegis doctor",
+      "problemMatcher": [],
+      "group": "none"
+    },
+    {
+      "label": "Aegis: Memory List",
+      "type": "shell",
+      "command": "aegis memory list",
+      "problemMatcher": [],
+      "group": "none"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "taskPrompt",
+      "type": "promptString",
+      "description": "Enter the coding task for Aegis"
+    }
+  ]
+}
