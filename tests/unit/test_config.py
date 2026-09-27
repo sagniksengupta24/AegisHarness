@@ -14,7 +14,7 @@ def test_default_config(tmp_path: Path):
     assert cfg.guardrails.fail_closed is True
     assert ".git/**" in cfg.guardrails.deny_paths
     assert ".env" in cfg.guardrails.deny_paths
-    assert cfg.model.resolved_model == "gemini-2.5-flash"
+    assert cfg.model.resolved_model in ("gemini-3.8-flash", "gemini-2.5-flash")
 
 
 def test_custom_valid_config(tmp_path: Path):

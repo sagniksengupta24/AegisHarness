@@ -63,7 +63,12 @@ class VerificationRunner:
 
             error_snippet = None
             if not is_pass:
-                error_snippet = exec_res.stderr.strip() or exec_res.stdout.strip() or exec_res.error
+                error_snippet = (
+                    exec_res.stderr.strip()
+                    or exec_res.stdout.strip()
+                    or exec_res.error
+                    or f"Command '{gate.command}' exited with code {exec_res.exit_code}"
+                )
                 # Extract last 10 lines of error for diagnosis
                 lines = error_snippet.splitlines()
                 if len(lines) > 10:

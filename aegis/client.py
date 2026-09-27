@@ -21,6 +21,7 @@ class ModelResponse(BaseModel):
     diagnosis: Optional[FailureDiagnosis] = None
     is_proposing_completion: bool = False
     raw_response: Optional[Any] = None
+    raw_parts: Optional[Any] = None
 
 
 class ModelClient(Protocol):
@@ -51,7 +52,7 @@ class GeminiModelClient:
                 "Gemini API key is required. Set the GEMINI_API_KEY environment variable "
                 "or configure it in .aegis.yaml."
             )
-        self.model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        self.model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
         self.temperature = temperature
 
         try:
@@ -91,26 +92,81 @@ class GeminiModelClient:
         contents = []
         for msg in messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content_text = msg.get("content", "")
             if role == "system":
-                continue  # Passed via config.system_instruction
-            contents.append(types.Content(
-                role="user" if role == "user" else "model",
-                parts=[types.Part.from_text(text=str(content))],
-            ))
+                continue
 
-        try:
-            resp = self.client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=config,
-            )
-        except Exception as e:
-            raise ModelError(f"Gemini API error during generate_content: {e}") from e
+            parts = []
+            if role == "tool":
+                tool_name = msg.get("tool_name", "tool")
+                output_val = msg.get("output", content_text)
+                parts.append(types.Part.from_function_response(
+                    name=tool_name,
+                    response={"result": output_val, "success": msg.get("success", True)},
+                ))
+                contents.append(types.Content(role="user", parts=parts))
+            elif role == "model":
+                raw_parts = msg.get("raw_parts")
+                if raw_parts:
+                    contents.append(types.Content(role="model", parts=list(raw_parts)))
+                else:
+                    if content_text:
+                        parts.append(types.Part.from_text(text=str(content_text)))
+                    for tc in msg.get("tool_calls", []):
+                        tc_name = getattr(tc, "name", tc.get("name") if isinstance(tc, dict) else "")
+                        tc_args = getattr(tc, "arguments", tc.get("arguments") if isinstance(tc, dict) else {})
+                        if tc_name:
+                            parts.append(types.Part.from_function_call(name=tc_name, args=tc_args))
+                    if parts:
+                        contents.append(types.Content(role="model", parts=parts))
+            else:
+                if content_text:
+                    parts.append(types.Part.from_text(text=str(content_text)))
+                contents.append(types.Content(role="user", parts=parts or [types.Part.from_text(text="")]))
+
+        resp = None
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                )
+                break
+            except Exception as e:
+                import re
+                import time
+                err_msg = str(e).lower()
+                is_quota = any(k in err_msg for k in ("429", "resource_exhausted", "rate limit", "quota"))
+                is_overload = any(k in err_msg for k in ("503", "unavailable", "high demand", "temporarily"))
+                is_transient = is_quota or is_overload
+                if is_transient and attempt < max_attempts:
+                    if is_quota:
+                        # Use API-provided retryDelay hint when available
+                        m = re.search(r"retry(?:\s+in)?\s+([0-9]+(?:\.[0-9]+)?)s?", err_msg)
+                        base_delay = float(m.group(1)) if m else (2.0 ** attempt)
+                        delay = min(base_delay + 1.0, 60.0)
+                    else:
+                        # 503 overload: exponential backoff with jitter (15s base)
+                        import random
+                        delay = min(15.0 * (2 ** (attempt - 1)) + random.uniform(0, 5), 90.0)
+                    logger.warning(
+                        "Transient API error on attempt %d/%d (%s). Retrying in %.1fs.",
+                        attempt, max_attempts, "quota" if is_quota else "overload", delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise ModelError(f"Gemini API error during generate_content: {e}") from e
 
         # Parse response
         parsed_text = resp.text if hasattr(resp, "text") else ""
         tool_calls: list[ToolCallRequest] = []
+        raw_parts = None
+        if hasattr(resp, "candidates") and resp.candidates:
+            cand = resp.candidates[0]
+            if hasattr(cand, "content") and cand.content and hasattr(cand.content, "parts"):
+                raw_parts = cand.content.parts
 
         if hasattr(resp, "function_calls") and resp.function_calls:
             for fc in resp.function_calls:
@@ -130,6 +186,7 @@ class GeminiModelClient:
             tool_calls=tool_calls,
             is_proposing_completion=is_proposing_completion,
             raw_response=resp,
+            raw_parts=raw_parts,
         )
 
 
@@ -170,3 +227,9 @@ class FakeModelClient:
             )
 
         return self.responses.pop(0)
+
+
+# Provider-neutral architectural aliases
+ModelProvider = ModelClient
+GeminiProvider = GeminiModelClient
+FakeProvider = FakeModelClient

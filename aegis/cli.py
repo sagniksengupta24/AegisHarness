@@ -487,7 +487,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     """Performs system diagnostic checks across runtime, tools, git, config, and models."""
     root = find_repo_root()
     print("=== Aegis Diagnostic Doctor ===\n")
-    all_ok = True
+    missing_deps: list[str] = []
+    config_error: Optional[str] = None
+    optional_limitations: list[str] = []
 
     # 1. Python version check
     py_ver = sys.version_info
@@ -497,7 +499,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"[✓] Python version: {py_str} (>= 3.12)")
     else:
         print(f"[✗] Python version: {py_str} (Requires Python >= 3.12)")
-        all_ok = False
+        missing_deps.append(f"Python >= 3.12 (current: {py_str})")
 
     # 2. Git check
     git_bin = shutil.which("git")
@@ -507,10 +509,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"[✓] Git: {git_ver}")
         except Exception:
             print("[✗] Git is installed but not responding.")
-            all_ok = False
+            missing_deps.append("Git installed but not responding")
     else:
         print("[✗] Git executable not found in PATH.")
-        all_ok = False
+        missing_deps.append("Git executable in PATH")
 
     # 3. Config check
     config_file = root / ".aegis.yaml"
@@ -520,9 +522,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"[✓] Configuration: Valid (.aegis.yaml, stack={cfg.project.stack})")
         except Exception as ce:
             print(f"[✗] Configuration invalid: {ce}")
-            all_ok = False
+            config_error = str(ce)
     else:
         print("[!] Configuration: .aegis.yaml not found (run 'aegis init' to scaffold)")
+        optional_limitations.append(".aegis.yaml not found (run 'aegis init' to scaffold)")
 
     # 4. Workspace permissions
     test_file = root / ".aegis_perm_test"
@@ -532,7 +535,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("[✓] Workspace permissions: Read and write verified")
     except Exception as e:
         print(f"[✗] Workspace permission error: {e}")
-        all_ok = False
+        missing_deps.append(f"Workspace write permission: {e}")
 
     # 5. Gemini configuration
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -541,6 +544,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"[✓] Gemini API Key: Configured ({masked})")
     else:
         print("[!] Gemini API Key: Not set in GEMINI_API_KEY (required for live model runs)")
+        optional_limitations.append("GEMINI_API_KEY unset (live Gemini requests unavailable)")
 
     # 6. Docker availability
     docker_ok = is_docker_available()
@@ -548,6 +552,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("[✓] Docker: Daemon is running (container isolation available)")
     else:
         print("[!] Docker: Daemon not running (falling back to secure LocalExecutor)")
+        optional_limitations.append("Docker daemon offline (falling back to LocalExecutor)")
 
     # 7. Daemon status
     daemon_client = DaemonClient(root)
@@ -555,13 +560,179 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("[✓] Background Daemon: Running")
     else:
         print("[!] Background Daemon: Stopped (CLI operates in standalone mode)")
+        optional_limitations.append("Daemon stopped (CLI operates in standalone mode)")
 
-    print("\n" + ("=" * 35))
-    if all_ok:
-        print("STATUS: HEALTHY - Aegis is ready for use.")
+    print("\n" + ("=" * 40))
+    if missing_deps:
+        print("STATUS: MISSING REQUIRED DEPENDENCY")
+        for dep in missing_deps:
+            print(f"  - Missing: {dep}")
+        return 1
+    elif config_error:
+        print("STATUS: CONFIGURATION ERROR")
+        print(f"  - Error: {config_error}")
+        return 1
+    elif optional_limitations:
+        print("STATUS: READY WITH OPTIONAL LIMITATIONS")
+        for lim in optional_limitations:
+            print(f"  - Limitation: {lim}")
         return 0
     else:
-        print("STATUS: WARNINGS - Please resolve the issues flagged above.")
+        print("STATUS: READY - All required and optional capabilities verified.")
+        return 0
+
+
+def cmd_commit(args: argparse.Namespace) -> int:
+    """Executes the Commit & Remember workflow.
+
+    1. Inspects Aegis session changes / uncommitted git changes.
+    2. Runs strict verification gates (cannot commit if gates fail).
+    3. Summarizes validated changes.
+    4. Extracts and saves a lesson to episodic memory if one exists.
+    5. Prepares a conventional commit message.
+    6. Does NOT automatically commit without human approval.
+    """
+    root = find_repo_root()
+    config = load_config(root)
+
+    print("=== Aegis Commit & Remember Workflow ===\n")
+
+    # 1. Verification gate check
+    if not getattr(args, "skip_verify", False):
+        print("[*] Running strict verification gates before commit...")
+        executor = get_executor(root, backend=config.execution.backend)
+        runner = VerificationRunner(root, executor, config.verification)
+        report = runner.run_all()
+        if report.status != "PASS":
+            print(f"[✗] Verification failed ({report.actionable_instruction}). Cannot commit broken changes.", file=sys.stderr)
+            return 1
+        print("[✓] All required verification gates passed.")
+    else:
+        print("[!] Warning: Verification gates bypassed via --skip-verify.")
+
+    # 2. Inspect session changes and git status
+    sessions_dir = root / ".aegis" / "sessions"
+    session_touched: list[str] = []
+    if sessions_dir.exists():
+        subdirs = [d for d in sessions_dir.iterdir() if d.is_dir()]
+        if subdirs:
+            subdirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            latest_session = subdirs[0]
+            checkpoint = SessionCheckpoint(root, session_id=latest_session.name)
+            session_touched = sorted(list(checkpoint.touched_files.union(checkpoint.created_files)))
+
+    # Also check git status
+    git_status_lines: list[str] = []
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            git_status_lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+    except Exception as e:
+        logger.debug(f"Git status query failed: {e}")
+
+    if not git_status_lines and not session_touched:
+        untracked = [str(p.relative_to(root)) for p in root.glob("*") if not p.name.startswith(".")]
+        if untracked:
+            session_touched = untracked
+        else:
+            print("[!] No modified, untracked, or session changes detected to commit.")
+            return 0
+
+    print(f"\n[*] Validated changes detected:")
+    if session_touched:
+        print(f"    Session files ({len(session_touched)}):")
+        for f in session_touched[:10]:
+            print(f"      - {f}")
+        if len(session_touched) > 10:
+            print(f"      ... and {len(session_touched) - 10} more")
+
+    if git_status_lines:
+        print(f"    Git working tree changes ({len(git_status_lines)}):")
+        for l in git_status_lines[:10]:
+            print(f"      {l}")
+        if len(git_status_lines) > 10:
+            print(f"      ... and {len(git_status_lines) - 10} more")
+
+    # 3. Lesson extraction and saving
+    lesson_text = getattr(args, "lesson", None)
+    if not lesson_text and not getattr(args, "dry_run", False) and not getattr(args, "yes", False):
+        try:
+            prompt_input = input("\n[?] Lesson learned to remember (optional, press Enter to skip): ").strip()
+            if prompt_input:
+                lesson_text = prompt_input
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    if lesson_text:
+        mem_manager = EpisodicMemoryManager(root, memory_path=config.memory.path)
+        relevant_files = session_touched or [l.split()[-1] for l in git_status_lines]
+        saved_entry = mem_manager.save_lesson(
+            lesson=lesson_text,
+            context=["commit", config.project.stack],
+            files=relevant_files[:5],
+            confidence=1.0,
+            source="commit_and_remember",
+        )
+        print(f"[✓] Lesson remembered (ID: {saved_entry.id}): '{saved_entry.lesson}'")
+
+    # 4. Prepare conventional commit message
+    if getattr(args, "message", None):
+        commit_msg = args.message
+    else:
+        # Determine prefix based on changed paths
+        all_touched = session_touched or [l.split()[-1] for l in git_status_lines]
+        if all("test" in f.lower() for f in all_touched):
+            prefix = "test"
+        elif any("fix" in f.lower() or "guard" in f.lower() for f in all_touched):
+            prefix = "fix"
+        elif any("doc" in f.lower() or f.endswith(".md") for f in all_touched):
+            prefix = "docs"
+        else:
+            prefix = "feat"
+
+        sample = all_touched[0].split("/")[-1] if all_touched else "workspace"
+        commit_msg = f"{prefix}: validate and update {sample}"
+
+    print(f"\n=== Prepared Conventional Commit ===")
+    print(f"Commit message: {commit_msg}")
+
+    # 5. Guard: Human approval check (NEVER commit automatically)
+    if getattr(args, "dry_run", False):
+        print("\n[✓] Dry run: commit prepared and validated. No git commit executed.")
+        return 0
+
+    if not getattr(args, "yes", False):
+        try:
+            confirm = input("\n[?] Execute git commit with this message? [y/N]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                print("[!] Commit cancelled by human operator. Working tree preserved.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\n[!] Commit cancelled. Working tree preserved.")
+            return 0
+
+    # User explicitly confirmed execution
+    try:
+        res = subprocess.run(
+            ["git", "commit", "-am", commit_msg],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            print(f"[✓] Committed successfully: {res.stdout.strip()}")
+            return 0
+        else:
+            print(f"[✗] Git commit failed: {res.stderr.strip()}", file=sys.stderr)
+            return 1
+    except Exception as e:
+        print(f"[✗] Git commit execution error: {e}", file=sys.stderr)
         return 1
 
 
@@ -593,6 +764,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # status
     p_status = subparsers.add_parser("status", help="Show system and session status")
+
+    # commit & remember
+    p_commit = subparsers.add_parser("commit", help="Commit validated changes & remember lessons learned")
+    p_commit.add_argument("--message", "-m", help="Conventional commit message override")
+    p_commit.add_argument("--lesson", "-l", help="Project lesson to store in episodic memory")
+    p_commit.add_argument("--dry-run", action="store_true", help="Prepare commit and save lesson without running git commit")
+    p_commit.add_argument("--yes", "-y", action="store_true", help="Bypass interactive confirmation prompt")
+    p_commit.add_argument("--skip-verify", action="store_true", help="Bypass strict verification check")
 
     # memory
     p_mem = subparsers.add_parser("memory", help="Inspect and manage episodic memory")
@@ -627,6 +806,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "verify": cmd_verify,
         "diff": cmd_diff,
         "status": cmd_status,
+        "commit": cmd_commit,
         "memory": cmd_memory,
         "daemon": cmd_daemon,
         "doctor": cmd_doctor,

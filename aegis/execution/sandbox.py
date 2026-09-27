@@ -47,10 +47,24 @@ class LocalExecutor(BaseExecutor):
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
         work_dir = (cwd or self.repo_root).resolve()
+        cmd_str = command if isinstance(command, str) else " ".join(command)
+
+        try:
+            work_dir.relative_to(self.repo_root)
+        except ValueError:
+            return ExecutionResult(
+                command=cmd_str,
+                exit_code=-1,
+                stdout="",
+                stderr=f"Security violation: working directory '{work_dir}' is outside repository root '{self.repo_root}'",
+                duration_ms=0,
+                timed_out=False,
+                error=f"Working directory outside repository root: {work_dir}",
+                backend="local",
+            )
+
         timeout_val = timeout or self.timeout_seconds
         env = self.secret_guard.get_safe_env(extra_env=extra_env)
-
-        cmd_str = command if isinstance(command, str) else " ".join(command)
         start_time = time.perf_counter()
 
         # We execute via a safe shell runner if command is a string with arguments

@@ -28,6 +28,36 @@ class DaemonClient:
         except Exception:
             return False
 
+    def connect(self, timeout: float = 15.0) -> socket.socket:
+        """Establishes connection to daemon via Unix socket or localhost TCP."""
+        client_sock = None
+        if self.sock_path.exists():
+            try:
+                client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client_sock.settimeout(timeout)
+                client_sock.connect(str(self.sock_path))
+                return client_sock
+            except Exception:
+                if client_sock:
+                    client_sock.close()
+                client_sock = None
+
+        if self.port_path.exists():
+            try:
+                port = int(self.port_path.read_text().strip())
+                client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_sock.settimeout(timeout)
+                client_sock.connect(("127.0.0.1", port))
+                return client_sock
+            except Exception as e:
+                if client_sock:
+                    client_sock.close()
+                raise DaemonError(f"Failed to connect to daemon TCP port: {e}") from e
+
+        raise DaemonError("Aegis daemon is not reachable (neither socket nor port available)")
+
+    _connect = connect
+
     def send_request(
         self,
         command: str,
@@ -35,31 +65,7 @@ class DaemonClient:
         timeout: float = 15.0,
     ) -> DaemonResponse:
         """Sends a structured request and awaits response."""
-        client_sock = None
-
-        if self.sock_path.exists():
-            try:
-                client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                client_sock.settimeout(timeout)
-                client_sock.connect(str(self.sock_path))
-            except Exception:
-                if client_sock:
-                    client_sock.close()
-                client_sock = None
-
-        if client_sock is None and self.port_path.exists():
-            try:
-                port = int(self.port_path.read_text().strip())
-                client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                client_sock.settimeout(timeout)
-                client_sock.connect(("127.0.0.1", port))
-            except Exception as e:
-                if client_sock:
-                    client_sock.close()
-                raise DaemonError(f"Failed to connect to daemon TCP port: {e}") from e
-
-        if client_sock is None:
-            raise DaemonError("Aegis daemon is not reachable (neither socket nor port available)")
+        client_sock = self.connect(timeout=timeout)
 
         try:
             request = DaemonRequest(
@@ -92,3 +98,31 @@ class DaemonClient:
             raise DaemonError(f"Malformed JSON response from daemon: {e}") from e
         finally:
             client_sock.close()
+
+    def ping(self, timeout: float = 5.0) -> DaemonResponse:
+        """Sends ping command to daemon."""
+        return self.send_request("ping", timeout=timeout)
+
+    def status(self, timeout: float = 5.0) -> DaemonResponse:
+        """Retrieves daemon status."""
+        return self.send_request("status", timeout=timeout)
+
+    def verify(self, timeout: float = 60.0) -> DaemonResponse:
+        """Triggers verification suite via daemon."""
+        return self.send_request("verify", timeout=timeout)
+
+    def run(self, task: str, model: Optional[str] = None, timeout: float = 300.0) -> DaemonResponse:
+        """Dispatches task execution to daemon."""
+        payload: dict[str, Any] = {"task": task}
+        if model:
+            payload["model"] = model
+        return self.send_request("run", payload=payload, timeout=timeout)
+
+    def cancel(self, target_id: Optional[str] = None, timeout: float = 10.0) -> DaemonResponse:
+        """Sends cancellation request for a running task to daemon."""
+        payload = {"target_id": target_id} if target_id else {}
+        return self.send_request("cancel", payload=payload, timeout=timeout)
+
+    def stop(self, timeout: float = 5.0) -> DaemonResponse:
+        """Requests daemon shutdown."""
+        return self.send_request("stop", timeout=timeout)

@@ -41,7 +41,17 @@ Inspects surgical changes introduced by the active or latest Aegis session:
 aegis diff
 ```
 
-### 5. Memory Management
+### 5. Commit & Remember
+Inspects session changes, verifies strict gates, saves an optional project lesson to episodic memory, prepares a conventional commit message, and requires human approval before committing:
+```bash
+# Prepare and preview commit without running git commit:
+aegis commit --dry-run
+
+# Commit validated changes with lesson:
+aegis commit -m "feat: add user authentication" --lesson "Remember to validate token expiration on auth middleware"
+```
+
+### 6. Memory Management
 ```bash
 # List persistent repository lessons
 aegis memory list
@@ -50,14 +60,14 @@ aegis memory list
 aegis memory add --lesson "Always run pytest with -q flag" --tags "tests,pytest"
 ```
 
-### 6. Background Daemon
+### 7. Background Daemon
 ```bash
 aegis daemon start
 aegis daemon status
 aegis daemon stop
 ```
 
-### 7. Diagnostics
+### 8. Diagnostics
 ```bash
 aegis doctor
 ```

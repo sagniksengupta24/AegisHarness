@@ -1,5 +1,7 @@
 """Bounded agent loop orchestrator enforcing fail-closed lifecycle transitions and security gates."""
 
+import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -35,6 +37,23 @@ from aegis.verifier.runner import VerificationRunner
 logger = get_logger("aegis.orchestrator")
 
 
+def normalize_failure_fingerprint(text: str) -> str:
+    """Normalizes error messages by stripping dynamic timestamps, addresses, durations, and PIDs."""
+    if not text:
+        return ""
+    # Strip ISO and bracketed timestamps
+    res = re.sub(r"\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b", "<TIMESTAMP>", text)
+    res = re.sub(r"\[?\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b\]?", "<TIME>", res)
+    # Strip memory hex addresses
+    res = re.sub(r"0x[0-9a-fA-F]{4,16}\b", "<HEXADDR>", res)
+    # Strip execution durations
+    res = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds)\b", "<DURATION>", res, flags=re.IGNORECASE)
+    # Strip PIDs
+    res = re.sub(r"\bpid[:\s=]+\d+\b", "pid <PID>", res, flags=re.IGNORECASE)
+    # Collapse multiple whitespace
+    return re.sub(r"\s+", " ", res).strip()
+
+
 class Orchestrator:
     """Core Aegis orchestrator managing the Plan -> Implement -> Verify -> Complete/Rollback lifecycle."""
 
@@ -52,6 +71,7 @@ class Orchestrator:
         self.client = model_client
         self.interactive = interactive or config.guardrails.interactive_by_default
         self.approval_callback = approval_callback
+        self._cancel_requested = threading.Event()
 
         # Core subsystems
         self.gateguard = GateGuard(
@@ -80,6 +100,10 @@ class Orchestrator:
         self.skill_loader = SkillLoader(self.repo_root)
         self.skill_detector = SkillDetector(self.repo_root)
         self.tracer = TelemetryTracer(self.repo_root, traces_dir_rel=self.config.telemetry.path, enabled=self.config.telemetry.enabled)
+
+    def cancel(self) -> None:
+        """Signals the running orchestrator to cancel execution safely."""
+        self._cancel_requested.set()
 
     def _build_system_instruction(
         self,
@@ -175,6 +199,21 @@ class Orchestrator:
             state_machine.turn = turn
             logger.debug(f"[Turn {turn}] Current state: {state_machine.current_state.value}")
 
+            # Check explicit cancellation request
+            if self._cancel_requested.is_set():
+                failure_error_message = "Task execution was cancelled."
+                final_status = AgentStatus.ABORTED
+                if not state_machine.is_terminal():
+                    state_machine.transition(AgentState.ABORTED, reason="Cancellation requested")
+                break
+
+            # Check maximum execution time limit
+            elapsed_time = time.perf_counter() - start_time
+            if elapsed_time > getattr(self.config.agent, "max_execution_time_seconds", 300):
+                failure_error_message = f"Agent execution time limit ({getattr(self.config.agent, 'max_execution_time_seconds', 300)}s) exceeded."
+                final_status = AgentStatus.FAILED
+                break
+
             # Check overall tool call budget
             if total_tool_calls >= self.config.agent.max_tool_calls:
                 failure_error_message = f"Tool call budget exceeded ({total_tool_calls} calls)."
@@ -195,8 +234,12 @@ class Orchestrator:
                 break
 
             # Append model turn to conversation history
-            if model_resp.text:
-                messages.append({"role": "model", "content": model_resp.text})
+            messages.append({
+                "role": "model",
+                "content": model_resp.text or "",
+                "tool_calls": model_resp.tool_calls,
+                "raw_parts": model_resp.raw_parts,
+            })
 
             # Handle transition from PLAN to IMPLEMENT
             if state_machine.current_state == AgentState.PLAN:
@@ -208,12 +251,39 @@ class Orchestrator:
 
             if has_tool_calls:
                 for tcall in model_resp.tool_calls:
+                    # Check cancellation before tool execution
+                    if self._cancel_requested.is_set():
+                        failure_error_message = "Task execution was cancelled."
+                        final_status = AgentStatus.ABORTED
+                        if not state_machine.is_terminal():
+                            state_machine.transition(AgentState.ABORTED, reason="Cancellation requested")
+                        break
+
                     total_tool_calls += 1
                     logger.info(f"Dispatching tool '{tcall.name}' (id: {tcall.id})")
 
                     tool_res = self.registry.dispatch(tcall, tool_context)
 
-                    # Append tool result to conversation
+                    # Detect repeated identical tool failures to prevent infinite loops
+                    tool_sig = f"{tcall.name}:{sorted(str(v) for v in tcall.arguments.items())}"
+                    norm_tool_err = normalize_failure_fingerprint(tool_res.error or "")
+                    combined_sig = f"{tool_sig}|err={norm_tool_err}"
+
+                    if not tool_res.success:
+                        if combined_sig == getattr(self, "_last_failing_tool_sig", None):
+                            self._failing_tool_count = getattr(self, "_failing_tool_count", 1) + 1
+                            if self._failing_tool_count >= 3:
+                                failure_error_message = f"Repeated identical tool failure 3 times for '{tcall.name}'. Terminating loop."
+                                final_status = AgentStatus.FAILED
+                                break
+                        else:
+                            self._last_failing_tool_sig = combined_sig
+                            self._failing_tool_count = 1
+                    else:
+                        self._last_failing_tool_sig = None
+                        self._failing_tool_count = 0
+
+                    # Append structured tool result to conversation
                     t_result_msg = (
                         f"TOOL RESULT ({tcall.name}):\n"
                         f"Success: {tool_res.success}\n"
@@ -221,12 +291,24 @@ class Orchestrator:
                     )
                     if tool_res.error:
                         t_result_msg += f"Error: {tool_res.error}\n"
-                    messages.append({"role": "user", "content": t_result_msg})
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_name": tcall.name,
+                        "call_id": tcall.id,
+                        "content": t_result_msg,
+                        "output": tool_res.output,
+                        "success": tool_res.success,
+                        "error": tool_res.error,
+                    })
 
                     if tcall.name == "run_verification":
                         ran_verification_in_turn = True
                         if "report" in tool_res.metadata:
                             last_verification_report = VerificationReport.model_validate(tool_res.metadata["report"])
+
+                if final_status in (AgentStatus.FAILED, AgentStatus.ABORTED) and failure_error_message:
+                    break
 
             # 3. Check for verification need
             # If the model proposes completion OR ran verification OR no tool calls in IMPLEMENT state:
@@ -254,8 +336,9 @@ class Orchestrator:
                     fail_summary = last_verification_report.summary if last_verification_report else "Unknown failure"
                     logger.warning(f"Verification gates FAILED (repair attempt {repair_count}/{self.config.agent.max_repairs}): {fail_summary}")
 
-                    # Check repeated failure loop
-                    cur_err = last_verification_report.actionable_instruction if last_verification_report else ""
+                    # Check repeated failure loop using normalized failure fingerprint
+                    raw_err = last_verification_report.actionable_instruction if last_verification_report else ""
+                    cur_err = normalize_failure_fingerprint(raw_err)
                     if cur_err and cur_err == last_failure_snippet:
                         consecutive_failures += 1
                         if consecutive_failures >= 3:
@@ -291,7 +374,7 @@ class Orchestrator:
         else:
             if not failure_error_message:
                 failure_error_message = f"Agent turn limit ({self.config.agent.max_turns}) exceeded."
-            logger.warning(f"Task failed ({final_status.value}): {failure_error_message}. Executing transactional rollback.")
+            logger.warning(f"Task stopped ({final_status.value}): {failure_error_message}. Executing transactional rollback.")
 
             # Rollback only Aegis changes
             try:
@@ -301,7 +384,8 @@ class Orchestrator:
 
             if not state_machine.is_terminal():
                 try:
-                    state_machine.transition(AgentState.FAILED, reason=failure_error_message)
+                    target_state = AgentState.ABORTED if final_status == AgentStatus.ABORTED else AgentState.FAILED
+                    state_machine.transition(target_state, reason=failure_error_message)
                 except Exception:
                     pass
 

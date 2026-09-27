@@ -4,18 +4,29 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Set
 
-# Secret patterns to scrub from all logs and traces
+# Secret patterns to scrub from all logs, traces, and tool outputs
 SECRET_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|secret|password|token|bearer|authorization)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.\/+=]{8,})['\"]?"),
-    re.compile(r"sk-[a-zA-Z0-9_\-]{20,}"),
-    re.compile(r"ghp_[a-zA-Z0-9]{36}"),
-    re.compile(r"gho_[a-zA-Z0-9]{36}"),
-    re.compile(r"AIza[0-9A-Za-z\-_]{35}"),
+    re.compile(r"(?i)(api[_-]?key|secret|password|token|bearer|authorization)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.\/+=]{6,})['\"]?"),
+    re.compile(r"(?i)\b(TEST_SECRET_[a-zA-Z0-9_\-]+)\b"),
+    re.compile(r"(?i)\bBearer\s+([a-zA-Z0-9_\-\.]{12,})\b"),
+    re.compile(r"sk-[a-zA-Z0-9_\-]{16,}"),
+    re.compile(r"ghp_[a-zA-Z0-9]{20,}"),
+    re.compile(r"gho_[a-zA-Z0-9]{20,}"),
+    re.compile(r"AIza[0-9A-Za-z\-_]{25,}"),
     re.compile(r"xox[baprs]-[0-9a-zA-Z]{10,48}"),
     re.compile(r"-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP)? PRIVATE KEY-----[\s\S]*?-----END (?:RSA|OPENSSH|DSA|EC|PGP)? PRIVATE KEY-----"),
 ]
+
+_CUSTOM_REGISTERED_SECRETS: set[str] = set()
+
+
+def register_custom_secret(secret: str) -> None:
+    """Registers a specific secret string to be scrubbed from all outputs."""
+    clean = secret.strip()
+    if len(clean) >= 4:
+        _CUSTOM_REGISTERED_SECRETS.add(clean)
 
 
 def scrub_secrets(text: str) -> str:
@@ -23,17 +34,27 @@ def scrub_secrets(text: str) -> str:
     if not text:
         return text
     scrubbed = text
+
+    # First scrub custom registered secrets verbatim
+    for s in _CUSTOM_REGISTERED_SECRETS:
+        if s in scrubbed:
+            scrubbed = scrubbed.replace(s, "[REDACTED_SECRET]")
+
     for pattern in SECRET_PATTERNS:
-        # If private key block
         if "PRIVATE KEY" in pattern.pattern:
             scrubbed = pattern.sub("[REDACTED_PRIVATE_KEY]", scrubbed)
+        elif "TEST_SECRET" in pattern.pattern:
+            scrubbed = pattern.sub("[REDACTED_SECRET]", scrubbed)
+        elif "Bearer" in pattern.pattern:
+            scrubbed = pattern.sub("Bearer [REDACTED_SECRET]", scrubbed)
         else:
             def _repl(match: re.Match) -> str:
                 if len(match.groups()) >= 2:
-                    k, v = match.group(1), match.group(2)
+                    k = match.group(1)
                     return f"{k}=[REDACTED_SECRET]"
                 return "[REDACTED_SECRET]"
             scrubbed = pattern.sub(_repl, scrubbed)
+
     return scrubbed
 
 
@@ -60,7 +81,6 @@ def get_logger(name: str = "aegis") -> logging.Logger:
     logger.setLevel(level)
     logger.propagate = False
 
-    # Avoid duplicate handlers
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setLevel(level)

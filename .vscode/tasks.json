@@ -35,6 +35,13 @@
       "command": "aegis memory list",
       "problemMatcher": [],
       "group": "none"
+    },
+    {
+      "label": "Aegis: Commit & Remember",
+      "type": "shell",
+      "command": "aegis commit --dry-run",
+      "problemMatcher": [],
+      "group": "none"
     }
   ],
   "inputs": [

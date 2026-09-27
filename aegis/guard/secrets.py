@@ -36,6 +36,11 @@ class SecretGuard:
         if additional_sensitive_vars:
             self.sensitive_vars.update(additional_sensitive_vars)
 
+    def register_secret(self, secret_str: str) -> None:
+        """Registers a custom secret string to be scrubbed across all operations."""
+        from aegis.logging import register_custom_secret
+        register_custom_secret(secret_str)
+
     def scan_content(self, text: str, context: str = "content") -> PolicyResult:
         """Inspects text for obvious high-entropy credentials or private keys."""
         if not text:

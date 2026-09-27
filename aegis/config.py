@@ -27,13 +27,14 @@ class ModelConfig(BaseModel):
         env_model = os.environ.get("GEMINI_MODEL")
         if env_model:
             return env_model
-        return "gemini-2.5-flash"
+        return "gemini-3.8-flash"
 
 
 class AgentBudgetConfig(BaseModel):
     max_turns: int = 24
     max_repairs: int = 5
     max_tool_calls: int = 100
+    max_execution_time_seconds: int = 300
     max_command_runtime_seconds: int = 60
     max_output_size_bytes: int = 100_000
     max_files_touched: int = 20

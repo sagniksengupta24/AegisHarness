@@ -1,5 +1,6 @@
 """CommandGuard for safe command tokenization, argument inspection, and policy enforcement."""
 
+import re
 import shlex
 from typing import List, Optional, Tuple, Union
 
@@ -33,8 +34,13 @@ BLOCKED_NETWORK_TOOLS = {
     "ncat",
     "socat",
     "telnet",
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "rsync",
+    "ftp",
 }
-
 
 DEFAULT_BLOCKED_PATTERNS = [
     ":(){ :|:& };:",
@@ -43,6 +49,8 @@ DEFAULT_BLOCKED_PATTERNS = [
     "dd if=/dev",
     "mkfs",
 ]
+
+CHAINING_OPERATORS = {";", "&&", "||", "|", "|&", "&"}
 
 
 class CommandGuard:
@@ -74,10 +82,28 @@ class CommandGuard:
 
         return tokens
 
+    def _split_into_subcommands(self, tokens: list[str]) -> list[list[str]]:
+        """Splits token stream on chaining and pipe operators (;, &&, ||, |, &)."""
+        subcommands: list[list[str]] = []
+        current: list[str] = []
+
+        for token in tokens:
+            if token in CHAINING_OPERATORS:
+                if current:
+                    subcommands.append(current)
+                    current = []
+            else:
+                current.append(token)
+        if current:
+            subcommands.append(current)
+
+        return subcommands
+
     def evaluate_command(self, cmd_input: Union[str, list[str]]) -> PolicyResult:
-        """Evaluates tokenized command against security policy."""
-        # 1. Check raw command string against blocked patterns first (catches fork bombs & raw substrings)
+        """Evaluates command string or tokens against security policy."""
         cmd_raw = cmd_input if isinstance(cmd_input, str) else " ".join(cmd_input)
+
+        # 1. Raw string checks against custom blocked patterns (fork bombs, etc.)
         for blocked_pat in self.custom_blocked:
             clean_pat = blocked_pat.strip()
             if clean_pat and clean_pat in cmd_raw:
@@ -87,6 +113,21 @@ class CommandGuard:
                     rule_name="custom_blocked_command",
                 )
 
+        # 2. Check for dangerous command substitutions in raw string
+        if "$(" in cmd_raw or "`" in cmd_raw:
+            # Check if substitution contains blocked binaries
+            sub_matches = re.findall(r"\$\(([^)]+)\)|`([^`]+)`", cmd_raw)
+            for m1, m2 in sub_matches:
+                inner_cmd = m1 or m2
+                inner_eval = self.evaluate_command(inner_cmd)
+                if inner_eval.decision != PolicyDecision.ALLOW:
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason=f"Command substitution blocked: {inner_eval.reason}",
+                        rule_name="nested_command_substitution",
+                    )
+
+        # 3. Tokenize command
         try:
             tokens = self.tokenize_command(cmd_input)
         except CommandBlockedError as e:
@@ -103,56 +144,88 @@ class CommandGuard:
                 rule_name="empty_command",
             )
 
-        cmd_str = " ".join(tokens)
-        executable = tokens[0].lower().split("/")[-1]
+        # 4. Split into subcommands across operators (; && || | &)
+        subcommands = self._split_into_subcommands(tokens)
 
-        # Check explicitly blocked binaries
-        if executable in BLOCKED_EXECUTABLES:
-            return PolicyResult(
-                decision=PolicyDecision.DENY,
-                reason=f"Executable '{executable}' is blocked by security policy (privilege escalation or interactive editor)",
-                rule_name="blocked_executable",
-                metadata={"executable": executable},
-            )
+        for sub_tokens in subcommands:
+            if not sub_tokens:
+                continue
 
-        # Check network tools if network not allowed
-        if not self.allow_network and executable in BLOCKED_NETWORK_TOOLS:
-            return PolicyResult(
-                decision=PolicyDecision.DENY,
-                reason=f"Network tool '{executable}' is forbidden when network is disabled",
-                rule_name="network_isolation",
-            )
+            # Strip path prefix: /usr/bin/sudo -> sudo
+            executable = sub_tokens[0].lower().split("/")[-1]
 
-        # Check destructive deletion patterns (e.g., rm -rf / or rm -rf ~)
-        if executable == "rm":
-            args = [a.lower() for a in tokens[1:]]
-            has_recursive = any(a in ("-r", "-rf", "-fr", "--recursive") or (a.startswith("-") and "r" in a) for a in args)
-            targets = [a for a in tokens[1:] if not a.startswith("-")]
-            if has_recursive:
-                dangerous_targets = {"/", "/*", "~", "~/", "*"}
-                for target in targets:
-                    if target in dangerous_targets or target.startswith("/etc") or target.startswith("/var"):
-                        return PolicyResult(
-                            decision=PolicyDecision.DENY,
-                            reason=f"Destructive recursive deletion of system target '{target}' is forbidden",
-                            rule_name="destructive_rm",
-                        )
-
-        # Check fork bombs and custom block patterns
-        for blocked_pat in self.custom_blocked:
-            clean_pat = blocked_pat.strip()
-            if clean_pat and clean_pat in cmd_str:
+            # Check blocked binaries
+            if executable in BLOCKED_EXECUTABLES:
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
-                    reason=f"Command matches blocked pattern '{clean_pat}'",
-                    rule_name="custom_blocked_command",
+                    reason=f"Executable '{executable}' is blocked by security policy (privilege escalation or interactive editor)",
+                    rule_name="blocked_executable",
+                    metadata={"executable": executable, "subcommand": sub_tokens},
                 )
+
+            # Check network tools if network not allowed
+            if not self.allow_network and executable in BLOCKED_NETWORK_TOOLS:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason=f"Network tool '{executable}' is forbidden when network is disabled",
+                    rule_name="network_isolation",
+                    metadata={"executable": executable},
+                )
+
+            # Check destructive recursive deletion
+            if executable == "rm":
+                args = [a.lower() for a in sub_tokens[1:]]
+                has_recursive = any(
+                    a in ("-r", "-rf", "-fr", "--recursive") or (a.startswith("-") and "r" in a)
+                    for a in args
+                )
+                targets = [a for a in sub_tokens[1:] if not a.startswith("-")]
+                if has_recursive:
+                    dangerous_targets = {"/", "/*", "~", "~/", "*"}
+                    for target in targets:
+                        clean_target = target.rstrip("/")
+                        if (
+                            target in dangerous_targets
+                            or clean_target in dangerous_targets
+                            or target == "/"
+                            or clean_target.startswith("/etc")
+                            or clean_target.startswith("/var")
+                            or clean_target.startswith("/usr")
+                            or clean_target.startswith("/boot")
+                            or clean_target.startswith("/sys")
+                        ):
+                            return PolicyResult(
+                                decision=PolicyDecision.DENY,
+                                reason=f"Destructive recursive deletion of system target '{target}' is forbidden",
+                                rule_name="destructive_rm",
+                            )
+
+            # Check dangerous system-level redirects
+            for idx, token in enumerate(sub_tokens):
+                target_file = ""
+                if token in (">", ">>", "1>", "2>", "&>"):
+                    if idx + 1 < len(sub_tokens):
+                        target_file = sub_tokens[idx + 1].strip()
+                elif token.startswith(">") or token.startswith(">>"):
+                    target_file = token.lstrip(">").strip()
+
+                if target_file and (
+                    target_file.startswith("/etc")
+                    or target_file.startswith("/boot")
+                    or target_file.startswith("/sys")
+                    or target_file.startswith("/root")
+                ):
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason=f"System file redirection to '{target_file}' is forbidden",
+                        rule_name="system_redirection",
+                    )
 
         return PolicyResult(
             decision=PolicyDecision.ALLOW,
-            reason="Command passed tokenization and policy checks",
+            reason="Command passed tokenization and policy checks across all subcommands",
             rule_name="allow_command",
-            metadata={"executable": executable, "tokens": tokens},
+            metadata={"tokens": tokens, "subcommands_count": len(subcommands)},
         )
 
     def validate_command(self, cmd_input: Union[str, list[str]]) -> list[str]:

@@ -37,7 +37,18 @@ htmlcov/
 .aegis/sessions/
 .aegis/traces/
 .aegis/*.sock
+.aegis/*.port
 .aegis/daemon.pid
+.aegis/*.bak
+
+# Secrets and environment files
+.env
+.env.*
+secrets/
+*.pem
+*.key
+id_rsa*
+credentials*
 
 # OS and Editor
 .DS_Store

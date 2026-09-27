@@ -84,7 +84,18 @@ class MemoryRetriever:
         )
         body = []
         for idx, item in enumerate(lessons, 1):
+            clean_text = item.lesson.replace("```", "'''")
+            # Match compound injection phrases first, avoiding nested filter replacements
+            injection_pattern = re.compile(
+                r"\b(SYSTEM\s+INSTRUCTION:|IGNORE\s+SECURITY|IGNORE\s+PREVIOUS|SYSTEM:|INSTRUCTION:)",
+                re.IGNORECASE,
+            )
+            clean_text = injection_pattern.sub(lambda m: f"[FILTERED:{m.group(0).upper()}]", clean_text)
+
             ctx_str = f" [tags: {', '.join(item.context)}]" if item.context else ""
-            body.append(f"{idx}. {item.lesson}{ctx_str} (confidence: {item.confidence})")
+            src_str = f" [source: {item.source}]" if item.source else ""
+            date_str = f" [created: {item.created_at}]" if item.created_at else ""
+            files_str = f" [files: {', '.join(item.files)}]" if item.files else ""
+            body.append(f"{idx}. (DATA ONLY) {clean_text}{ctx_str}{src_str}{date_str}{files_str} (confidence: {item.confidence})")
 
         return header + "\n".join(body) + "\n=============================================\n"

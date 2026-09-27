@@ -66,18 +66,41 @@ class EpisodicMemoryManager:
         """Adds a new validated lesson and persists to disk."""
         self._ensure_dir()
         existing = self.load_lessons()
+        cleaned_lesson = lesson.strip()
 
-        new_entry = MemoryLesson(
-            id=str(uuid.uuid4())[:8],
-            lesson=lesson.strip(),
-            context=context or [],
-            source=source,
-            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            confidence=confidence,
-            files=files or [],
-        )
+        # Deduplication check: merge if identical normalized lesson exists
+        norm_key = cleaned_lesson.lower()
+        matched_idx = -1
+        for idx, entry in enumerate(existing):
+            if entry.lesson.strip().lower() == norm_key:
+                matched_idx = idx
+                break
 
-        existing.append(new_entry)
+        if matched_idx >= 0:
+            existing_entry = existing[matched_idx]
+            merged_context = sorted(list(set(existing_entry.context + (context or []))))
+            merged_files = sorted(list(set(existing_entry.files + (files or []))))
+            new_entry = MemoryLesson(
+                id=existing_entry.id,
+                lesson=cleaned_lesson,
+                context=merged_context,
+                source=source,
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                confidence=max(existing_entry.confidence, confidence),
+                files=merged_files,
+            )
+            existing[matched_idx] = new_entry
+        else:
+            new_entry = MemoryLesson(
+                id=str(uuid.uuid4())[:8],
+                lesson=cleaned_lesson,
+                context=context or [],
+                source=source,
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                confidence=confidence,
+                files=files or [],
+            )
+            existing.append(new_entry)
 
         # Enforce maximum entries bound
         if len(existing) > self.max_entries:

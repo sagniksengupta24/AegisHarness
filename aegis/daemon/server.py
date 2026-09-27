@@ -33,6 +33,8 @@ class DaemonServer:
         self.server_socket: Optional[socket.socket] = None
         self.start_time = time.time()
         self.is_tcp = False
+        self.active_tasks: dict[str, Any] = {}
+        self._task_lock = threading.Lock()
 
     def _cleanup_stale_resources(self) -> None:
         """Removes existing socket, port, and pid file if previous process died."""
@@ -208,6 +210,80 @@ class DaemonServer:
                 status="OK",
                 result=report.model_dump(),
             )
+
+        elif cmd == "run":
+            task_str = request.payload.get("task")
+            if not task_str:
+                return DaemonResponse(
+                    request_id=request.request_id,
+                    status="ERROR",
+                    error="Missing required 'task' in run request payload",
+                )
+            config = load_config(self.repo_root)
+            model_override = request.payload.get("model")
+
+            custom_client = getattr(self, "model_client", None)
+            if custom_client is None:
+                try:
+                    from aegis.client import GeminiModelClient
+                    custom_client = GeminiModelClient(
+                        model_name=model_override or config.model.resolved_model,
+                        temperature=config.model.temperature,
+                    )
+                except Exception as me:
+                    return DaemonResponse(
+                        request_id=request.request_id,
+                        status="ERROR",
+                        error=f"Model initialization error: {me}",
+                    )
+
+            from aegis.orchestrator import Orchestrator
+            from aegis.models import AgentStatus
+            orchestrator = Orchestrator(
+                repo_root=self.repo_root,
+                config=config,
+                model_client=custom_client,
+            )
+            with self._task_lock:
+                self.active_tasks[request.request_id] = orchestrator
+
+            try:
+                result = orchestrator.run_task(task_str)
+            finally:
+                with self._task_lock:
+                    self.active_tasks.pop(request.request_id, None)
+
+            return DaemonResponse(
+                request_id=request.request_id,
+                status="OK" if result.status == AgentStatus.COMPLETED else "FAILED",
+                result=result.model_dump(),
+                error=result.error,
+            )
+
+        elif cmd == "cancel":
+            target_id = request.payload.get("target_id") or request.payload.get("request_id")
+            with self._task_lock:
+                if target_id and target_id in self.active_tasks:
+                    self.active_tasks[target_id].cancel()
+                    return DaemonResponse(
+                        request_id=request.request_id,
+                        status="OK",
+                        result={"message": f"Task '{target_id}' cancellation signal sent"},
+                    )
+                elif not target_id and self.active_tasks:
+                    for orch in self.active_tasks.values():
+                        orch.cancel()
+                    return DaemonResponse(
+                        request_id=request.request_id,
+                        status="OK",
+                        result={"message": f"Cancelled {len(self.active_tasks)} active tasks"},
+                    )
+                else:
+                    return DaemonResponse(
+                        request_id=request.request_id,
+                        status="ERROR",
+                        error=f"No active task found matching '{target_id}'",
+                    )
 
         elif cmd == "stop":
             def _delayed_stop():

@@ -1,5 +1,6 @@
 ---
 description: "Aegis deterministic verification and safety rules for Antigravity"
+trigger: always_on
 globs: ["**/*"]
 alwaysApply: true
 ---
